@@ -1,0 +1,1154 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>日本地震ダッシュボード</title>
+
+  <!--
+    ============================================================
+    日本 地震ダッシュボード（単一HTMLファイル）
+    データ: 地震情報共有サイト P2PQuake API（一次情報: 気象庁）
+    地図: Leaflet + OpenStreetMap / グラフ: Chart.js
+    ============================================================
+    【SRI（サブリソース完全性）について】
+    本番公開時はCDN <script>/<link> に integrity="sha384-..." を付与すると
+    サプライチェーン改ざんを検知できます。ハッシュは以下で生成できます:
+      curl -sL <URL> | openssl dgst -sha384 -binary | openssl base64 -A
+    （本ファイル作成環境ではCDNへ到達できずハッシュ生成不可のため未付与）
+  -->
+
+  <!-- 多層防御: 接続先・画像・スクリプト元を制限（XSS時の被害低減） -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com;
+    style-src 'self' 'unsafe-inline' https://unpkg.com;
+    img-src 'self' data: https://*.tile.openstreetmap.org https://*.openstreetmap.org;
+    connect-src https://api.p2pquake.net;
+    font-src 'self' data:;">
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="anonymous" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js" crossorigin="anonymous"></script>
+  <style>
+    /* ── デザイントークン（色・角丸・影・数値書体の単一基盤） ── */
+    :root {
+      --navy: #172033;          /* ヘッダー等の濃色 */
+      --ink: #0f172a;           /* 主要テキスト */
+      --muted: #5b6675;         /* 補助テキスト */
+      --faint: #8a94a3;         /* 最も弱いテキスト */
+      --line: #e6e9ef;          /* 罫線（弱） */
+      --line-2: #cdd4df;        /* 罫線（強）/入力枠 */
+      --bg: #eef1f6;            /* アプリ背景 */
+      --surface: #ffffff;       /* 面 */
+      --raise: #f6f8fb;         /* 一段沈めた面（カード地） */
+      --accent: #3b6df5;        /* アクセント（青の基準） */
+      --accent-700: #2a55cc;
+      --accent-50: #eaf0fe;
+      --r: 8px; --r-sm: 6px; --r-xs: 4px; --pill: 999px;
+      --sh: 0 1px 2px rgba(15,23,42,.06), 0 1px 3px rgba(15,23,42,.05);
+      --sh-pop: 0 10px 30px rgba(15,23,42,.18);
+      --mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+      --num: "Helvetica Neue", Arial, sans-serif; /* 数値: tabular指定で桁揃え */
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Helvetica Neue', Arial, sans-serif; background: var(--bg); color: var(--ink);
+      display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+    /* 数値の桁揃え（テーブル・KPI・分布で共通） */
+    .num, .mag-badge, .s-value, .mb-label, .mb-count, .sc-count { font-variant-numeric: tabular-nums; }
+
+    /* ヘッダー */
+    header {
+      background: var(--navy); color: white; padding: 13px 20px;
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; flex-shrink: 0; flex-wrap: wrap;
+      box-shadow: 0 1px 0 rgba(255,255,255,.04), 0 2px 8px rgba(15,23,42,.18);
+      z-index: 5;
+    }
+    header h1 { font-size: 1.22rem; font-weight: 700; letter-spacing: .01em; }
+    header p  { font-size: 0.73rem; color: #9aa7bd; margin-top: 3px; }
+    .header-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    #auto-status { font-size: 0.73rem; color: #9aa7bd; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .hbtn, .hbtn-ghost {
+      border-radius: var(--r-sm); font-size: 0.84rem; font-weight: 600; cursor: pointer;
+      padding: 7px 15px; white-space: nowrap; transition: background .15s, border-color .15s;
+    }
+    .hbtn { background: var(--accent); color: white; border: 1px solid transparent; box-shadow: var(--sh); }
+    .hbtn:hover { background: var(--accent-700); }
+    .hbtn:disabled { background: #6b7686; box-shadow: none; cursor: not-allowed; }
+    .hbtn-ghost { background: rgba(255,255,255,.04); color: #c7d2e3; border: 1px solid rgba(255,255,255,.16); font-weight: 500; }
+    .hbtn-ghost:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.28); }
+
+    /* 通知バナー（エラー・警告・情報） */
+    #banner {
+      padding: 8px 20px; font-size: 0.82rem; display: flex; align-items: center;
+      justify-content: space-between; gap: 12px; flex-shrink: 0;
+    }
+    #banner.error { background: #fef2f2; color: #b91c1c; border-bottom: 1px solid #fecaca; }
+    #banner.warn  { background: #fffbeb; color: #b45309; border-bottom: 1px solid #fde68a; }
+    #banner.info  { background: #eff6ff; color: #1d4ed8; border-bottom: 1px solid #bfdbfe; }
+    #banner .banner-actions { display: flex; gap: 8px; align-items: center; }
+    #banner button {
+      background: rgba(0,0,0,0.06); border: none; border-radius: 5px;
+      padding: 3px 10px; font-size: 0.78rem; cursor: pointer; color: inherit;
+    }
+
+    /* コントロールバー */
+    .controls {
+      background: var(--surface); padding: 9px 20px; border-bottom: 1px solid var(--line);
+      display: flex; gap: 14px; align-items: center; flex-wrap: wrap; flex-shrink: 0;
+    }
+    .ctrl-group { display: flex; align-items: center; gap: 6px; }
+    .ctrl-group label { font-size: 0.78rem; color: var(--muted); white-space: nowrap; font-weight: 500; }
+    .controls select, .controls input[type="date"] {
+      padding: 4px 8px; border: 1px solid var(--line-2); border-radius: var(--r-sm);
+      font-size: 0.8rem; background: var(--surface); color: var(--ink);
+    }
+    .controls select:hover, .controls input[type="date"]:hover { border-color: #b3bdcc; }
+    .controls input[type="date"] { width: 140px; }
+    #clear-filter {
+      font-size: 0.76rem; padding: 4px 11px; border: 1px solid var(--line-2);
+      border-radius: var(--r-sm); background: var(--surface); color: var(--muted); cursor: pointer; font-weight: 500;
+    }
+    #clear-filter:hover { background: var(--raise); border-color: #b3bdcc; }
+    #status { font-size: 0.76rem; color: var(--muted); margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+    /* メインエリア: [地図 | テーブル | 統計] */
+    .middle {
+      display: grid; grid-template-columns: 46% 1fr 290px;
+      flex: 1; min-height: 0;
+    }
+    #map { width: 100%; height: 100%; border-right: 1px solid var(--line); }
+
+    .table-col { display: flex; flex-direction: column; background: var(--surface); min-height: 0; border-right: 1px solid var(--line); }
+    .table-col .table-section { flex: 1; overflow: auto; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    thead th {
+      background: var(--raise); color: var(--muted); font-weight: 600; padding: 9px 12px;
+      text-align: left; border-bottom: 1px solid var(--line-2);
+      position: sticky; top: 0; z-index: 1; white-space: nowrap;
+      font-size: 0.7rem; letter-spacing: .04em; text-transform: uppercase;
+    }
+    tbody tr { border-bottom: 1px solid var(--line); cursor: pointer; transition: background .12s; }
+    tbody tr:nth-child(even) { background: #fafbfd; }
+    tbody tr:hover { background: var(--accent-50); }
+    tbody tr.selected { background: #dde7fd !important; box-shadow: inset 3px 0 0 var(--accent); }
+    tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--accent-50); }
+    tbody td { padding: 8px 12px; color: var(--ink); }
+    /* 数値・バッジ列は中央寄せで視線を揃える（M・深さ・最大震度） */
+    thead th:nth-child(3), thead th:nth-child(4), thead th:nth-child(5),
+    tbody td:nth-child(3), tbody td:nth-child(4), tbody td:nth-child(5) { text-align: center; }
+    tbody td:nth-child(4) { color: var(--muted); font-variant-numeric: tabular-nums; }
+    tbody td:nth-child(1) { color: var(--muted); font-variant-numeric: tabular-nums; }
+    .mag-badge { display: inline-block; min-width: 2.6em; padding: 2px 8px; border-radius: var(--pill); font-weight: 700; font-size: 0.78rem; }
+    .shindo-badge { display: inline-block; min-width: 1.8em; padding: 2px 6px; border-radius: var(--r-xs); font-size: 0.78rem; font-weight: 700; }
+    .empty-msg { text-align: center; padding: 28px 16px; color: var(--muted); }
+    .empty-msg .hint { display: block; margin-top: 8px; font-size: 0.78rem; color: var(--faint); }
+
+    /* 統計パネル（右端・縦いっぱい / 下余白が出ないよう均等配置） */
+    .stats-panel { display: flex; flex-direction: column; gap: 12px; justify-content: space-between; padding: 12px 14px; overflow-y: auto; background: white; }
+    .section-title { font-size: 0.68rem; font-weight: 700; color: var(--faint); letter-spacing: 0.07em; text-transform: uppercase; margin-bottom: 8px; }
+    .stat-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 8px; }
+    .stat-card { background: var(--raise); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 9px 11px; }
+    .stat-card .s-label { font-size: 0.66rem; color: var(--faint); text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+    .stat-card .s-value { font-size: 1.42rem; font-weight: 800; color: var(--navy); line-height: 1.15; margin-top: 2px; }
+    .stat-card .s-sub { font-size: 0.68rem; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* 震度タイル（3列グリッド・上段=震度7/6強/6弱、震度が大きいほどタイルも大きい / 0件は退色） */
+    .shindo-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; align-items: stretch; }
+    .shindo-cell {
+      border-radius: var(--r-xs); padding: 5px 2px; text-align: center; font-weight: 600;
+      display: flex; flex-direction: column; justify-content: center; gap: 1px; transition: opacity .2s;
+    }
+    .shindo-cell.zero { opacity: .3; filter: saturate(.5); }
+    .shindo-cell .sc-label { opacity: .9; }
+    .shindo-cell .sc-count { font-weight: 800; line-height: 1.05; }
+    /* 深刻度による大きさの段階（大→小） */
+    .shindo-cell.t-lg { min-height: 58px; }
+    .shindo-cell.t-lg .sc-label { font-size: 0.74rem; } .shindo-cell.t-lg .sc-count { font-size: 1.35rem; }
+    .shindo-cell.t-md { min-height: 46px; }
+    .shindo-cell.t-md .sc-label { font-size: 0.66rem; } .shindo-cell.t-md .sc-count { font-size: 1.08rem; }
+    .shindo-cell.t-sm { min-height: 36px; }
+    .shindo-cell.t-sm .sc-label { font-size: 0.6rem; }  .shindo-cell.t-sm .sc-count { font-size: 0.92rem; }
+
+    /* Mバー */
+    .mag-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+    .mag-bar .mb-label { width: 36px; text-align: right; font-size: 0.72rem; color: var(--muted); font-weight: 600; }
+    .mag-bar .mb-bg { flex: 1; background: #eef1f6; border-radius: var(--pill); height: 10px; overflow: hidden; }
+    .mag-bar .mb-fill { height: 100%; border-radius: var(--pill); min-width: 0; transition: width .4s; }
+    .mag-bar .mb-count { width: 26px; font-size: 0.72rem; color: var(--muted); text-align: right; }
+
+    /* 下段: タイムライン（横幅いっぱい） */
+    .bottom { border-top: 1px solid var(--line-2); background: var(--surface); flex-shrink: 0; height: 200px; }
+    .timeline-panel { padding: 12px 18px; display: flex; flex-direction: column; height: 100%; }
+    .timeline-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+    .timeline-header .section-title { margin-bottom: 0; }
+    .timeline-toggle { display: flex; margin-left: auto; background: var(--raise); border: 1px solid var(--line-2); border-radius: var(--r-sm); padding: 2px; gap: 2px; }
+    .tgl-btn { padding: 3px 12px; font-size: 0.74rem; font-weight: 600; border: none; border-radius: var(--r-xs); background: transparent; cursor: pointer; color: var(--muted); }
+    .tgl-btn.active { background: var(--navy); color: white; }
+    #timeline-canvas-wrap { position: relative; flex: 1; min-height: 0; }
+
+    /* 地図凡例 */
+    .map-legend { background: rgba(255,255,255,0.94); padding: 7px 9px; border-radius: var(--r-sm); box-shadow: var(--sh); font-size: 0.72rem; line-height: 1.5; color: var(--muted); }
+    .map-legend .ml-title { font-weight: 700; color: var(--ink); margin-bottom: 3px; }
+    .map-legend .ml-row { display: flex; align-items: center; gap: 6px; }
+    .map-legend .ml-dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+
+    /* 震度詳細ポップアップ（画面内にクランプするフローティングカード） */
+    #detail-popup {
+      display: none; flex-direction: column;
+      position: fixed; right: 16px; bottom: 16px;
+      background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
+      box-shadow: var(--sh-pop); padding: 14px;
+      width: min(92vw, 340px); max-height: min(55vh, 320px); z-index: 1200;
+    }
+    #detail-popup.open { display: flex; }
+    #detail-popup .popup-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; }
+    #detail-popup h3 { font-size: 0.84rem; font-weight: 700; color: var(--ink); line-height: 1.4; flex: 1; }
+    #detail-popup .close-btn { background: none; border: none; color: var(--faint); cursor: pointer; font-size: 1.05rem; padding: 0 0 0 8px; line-height: 1; }
+    #detail-popup .close-btn:hover { color: var(--ink); }
+    .intensity-list { display: flex; flex-direction: column; gap: 5px; overflow-y: auto; }
+    .intensity-item { display: flex; align-items: flex-start; gap: 8px; font-size: 0.78rem; }
+    .intensity-item .ii-shindo { flex-shrink: 0; width: 64px; }
+    .intensity-item .ii-prefs { color: var(--muted); line-height: 1.45; }
+
+    /* レスポンシブ: 狭い画面では縦スタックにして崩れを防ぐ */
+    @media (max-width: 1100px) {
+      body { height: auto; overflow-y: auto; }
+      .middle { display: flex; flex-direction: column; }
+      #map { height: 340px; border-right: none; border-bottom: 1px solid #e2e8f0; }
+      .table-col { border-right: none; border-bottom: 1px solid #e2e8f0; max-height: 380px; }
+      .stats-panel { border-bottom: 1px solid #e2e8f0; }
+      .stat-grid { grid-template-columns: repeat(4,1fr); }
+      .bottom { height: 260px; }
+      #detail-popup { right: 8px; left: 8px; bottom: 8px; width: auto; }
+    }
+    @media (max-width: 560px) {
+      .stat-grid { grid-template-columns: repeat(2,1fr); }
+      #status { margin-left: 0; width: 100%; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>日本 地震ダッシュボード</h1>
+    <p>データ: 地震情報共有サイト P2PQuake API（一次情報: 気象庁） ／ 地図: © OpenStreetMap</p>
+  </div>
+  <div class="header-right">
+    <span id="auto-status" title="このページを開いたときに、前回取得から1週間以上なら自動取得します（常駐スケジューラではありません）"></span>
+    <button id="export-btn" class="hbtn-ghost" title="蓄積データをJSONで保存（バックアップ）">エクスポート</button>
+    <button id="import-btn" class="hbtn-ghost" title="JSONバックアップから復元・統合">インポート</button>
+    <button id="fetch-btn" class="hbtn">データを取得</button>
+    <input type="file" id="import-file" accept="application/json,.json" hidden>
+  </div>
+</header>
+
+<div id="banner" role="alert" aria-live="assertive" hidden></div>
+
+<div class="controls">
+  <div class="ctrl-group">
+    <label for="limit-select">件数</label>
+    <select id="limit-select"></select>
+  </div>
+  <div class="ctrl-group">
+    <label>期間</label>
+    <input type="date" id="date-from" aria-label="開始日">
+    <span style="font-size:0.8rem;color:#94a3b8">〜</span>
+    <input type="date" id="date-to" aria-label="終了日">
+  </div>
+  <div class="ctrl-group">
+    <label for="min-mag-select">最小M</label>
+    <select id="min-mag-select">
+      <option value="0">すべて</option>
+      <option value="3">M3以上</option>
+      <option value="4">M4以上</option>
+      <option value="5">M5以上</option>
+      <option value="6">M6以上</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <label for="min-shindo-select">最小震度</label>
+    <select id="min-shindo-select">
+      <option value="-1">すべて</option>
+      <option value="10">震度1以上</option>
+      <option value="20">震度2以上</option>
+      <option value="30" selected>震度3以上</option>
+      <option value="40">震度4以上</option>
+      <option value="45">震度5弱以上</option>
+      <option value="55">震度6弱以上</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <label for="pref-select">都道府県</label>
+    <select id="pref-select"><option value="">すべて</option></select>
+  </div>
+  <div class="ctrl-group">
+    <label><input type="checkbox" id="japan-only" checked> 日本近隣のみ</label>
+  </div>
+  <button id="clear-filter" type="button">フィルター解除</button>
+  <span id="status">読み込み中...</span>
+</div>
+
+<!-- 地図 | テーブル | 統計 -->
+<div class="middle">
+  <div id="map"></div>
+  <div class="table-col">
+    <div class="table-section">
+      <table>
+        <thead>
+          <tr><th>発生日時</th><th>震源地</th><th>M</th><th>深さ</th><th>最大震度</th></tr>
+        </thead>
+        <tbody id="quake-tbody">
+          <tr><td colspan="5" class="empty-msg">データを取得中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="stats-panel">
+    <div>
+      <div class="section-title">サマリー</div>
+      <div class="stat-grid">
+        <div class="stat-card"><div class="s-label">表示件数</div><div class="s-value" id="stat-total">—</div><div class="s-sub">蓄積: <span id="stat-stored">—</span>件</div></div>
+        <div class="stat-card"><div class="s-label">最大規模</div><div class="s-value" id="stat-max-mag">—</div><div class="s-sub" id="stat-max-mag-loc">—</div></div>
+        <div class="stat-card"><div class="s-label">平均M</div><div class="s-value" id="stat-avg-mag">—</div><div class="s-sub">表示中の平均</div></div>
+        <div class="stat-card"><div class="s-label">最新地震</div><div class="s-value" id="stat-latest-mag">—</div><div class="s-sub" id="stat-latest-time">—</div></div>
+      </div>
+    </div>
+    <div>
+      <div class="section-title">震度分布</div>
+      <div class="shindo-row" id="shindo-grid"></div>
+    </div>
+    <div>
+      <div class="section-title">マグニチュード分布</div>
+      <div id="mag-bars"></div>
+    </div>
+  </div>
+</div>
+
+<!-- タイムライン（下段・横幅いっぱい） -->
+<div class="bottom">
+  <div class="timeline-panel">
+    <div class="timeline-header">
+      <div class="section-title">時系列チャート — 規模と頻度</div>
+      <div class="timeline-toggle">
+        <button class="tgl-btn" id="tgl-month" type="button">月別</button>
+        <button class="tgl-btn active" id="tgl-bar" type="button">日別</button>
+      </div>
+    </div>
+    <div id="timeline-canvas-wrap"><canvas id="timeline-chart"></canvas></div>
+  </div>
+</div>
+
+<!-- 震度詳細ポップアップ -->
+<div id="detail-popup" role="dialog" aria-modal="false" aria-labelledby="detail-title">
+  <div class="popup-header">
+    <h3 id="detail-title">—</h3>
+    <button class="close-btn" id="detail-close" type="button" aria-label="詳細を閉じる">✕</button>
+  </div>
+  <div class="intensity-list" id="detail-intensity-list"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin="anonymous"></script>
+<script>
+"use strict";
+// ============================================================
+//  設定（運用パラメータはここに集約）
+// ============================================================
+const CONFIG = {
+  autoIntervalMs: 7 * 24 * 60 * 60 * 1000, // 自動取得の間隔（1週間）
+  apiBase:        'https://api.p2pquake.net/v2/history',
+  apiCodes:       551,                      // 551 = 地震情報
+  apiPageSize:    100,                      // P2PQuake APIの1回の最大件数
+  japanBounds:    { latMin: 20, latMax: 48, lonMin: 122, lonMax: 156 }, // 日本近隣BBox
+  maxStored:      5000,                     // 蓄積上限（超過時は古い順に剪定）
+  fetchTimeoutMs: 15000,                    // fetchタイムアウト
+  fetchRetries:   2,                        // リトライ回数（指数バックオフ）
+  coordUnknown:   -200,                     // P2PQuakeの緯度経度欠損センチネル
+  limitOptions:   [50, 100, 200, 500],
+  defaultLimit:   100,
+};
+
+const STORAGE_KEY       = 'jishin_data';
+const STORAGE_FETCH_KEY = 'jishin_last_fetch';
+
+// ============================================================
+//  震度・マグニチュードの定義
+// ============================================================
+// P2PQuakeのscaleコード（46/48は「以上と推定」の中間値も含む）
+const SHINDO_MAP = {
+  10: { label:'震度1',       short:'1',     bg:'#e0f2fe', color:'#0369a1' },
+  20: { label:'震度2',       short:'2',     bg:'#bae6fd', color:'#0284c7' },
+  30: { label:'震度3',       short:'3',     bg:'#86efac', color:'#15803d' },
+  40: { label:'震度4',       short:'4',     bg:'#fde68a', color:'#92400e' },
+  45: { label:'震度5弱',     short:'5弱',   bg:'#fed7aa', color:'#c2410c' },
+  46: { label:'震度5弱以上(推定)', short:'5弱+', bg:'#fdba74', color:'#9a3412' },
+  50: { label:'震度5強',     short:'5強',   bg:'#fca5a5', color:'#b91c1c' },
+  48: { label:'震度5強以上(推定)', short:'5強+', bg:'#f87171', color:'#7f1d1d' },
+  55: { label:'震度6弱',     short:'6弱',   bg:'#f87171', color:'#7f1d1d' },
+  60: { label:'震度6強',     short:'6強',   bg:'#dc2626', color:'#fff'    },
+  70: { label:'震度7',       short:'7',     bg:'#7c3aed', color:'#fff'    },
+};
+// 震度タイル: 3列グリッドで 大→小 の降順（上段=7/6強/6弱）。深刻度でサイズを段階化。
+const SHINDO_TILE_KEYS = [70,60,55,50,45,40,30,20,10];
+const SHINDO_TIER = { 70:'t-lg',60:'t-lg',55:'t-lg', 50:'t-md',45:'t-md',40:'t-md', 30:'t-sm',20:'t-sm',10:'t-sm' };
+
+// マグニチュード階級（統計バーとタイムラインで共有 = 表記の不整合を防止）
+const MAG_BINS = [
+  { key:'m7', label:'M7+', min:7, max:Infinity, color:'#7c3aed' },
+  { key:'m6', label:'M6',  min:6, max:7,        color:'#dc2626' },
+  { key:'m5', label:'M5',  min:5, max:6,        color:'#ea580c' },
+  { key:'m4', label:'M4',  min:4, max:5,        color:'#d97706' },
+  { key:'m3', label:'M3',  min:3, max:4,        color:'#65a30d' },
+  { key:'m0', label:'~M3', min:0, max:3,        color:'#38bdf8' },
+];
+
+const PREF_NAMES = {
+  1:'北海道',2:'青森県',3:'岩手県',4:'宮城県',5:'秋田県',6:'山形県',7:'福島県',
+  8:'茨城県',9:'栃木県',10:'群馬県',11:'埼玉県',12:'千葉県',13:'東京都',14:'神奈川県',
+  15:'新潟県',16:'富山県',17:'石川県',18:'福井県',19:'山梨県',20:'長野県',
+  21:'岐阜県',22:'静岡県',23:'愛知県',24:'三重県',25:'滋賀県',26:'京都府',
+  27:'大阪府',28:'兵庫県',29:'奈良県',30:'和歌山県',31:'鳥取県',32:'島根県',
+  33:'岡山県',34:'広島県',35:'山口県',36:'徳島県',37:'香川県',38:'愛媛県',
+  39:'高知県',40:'福岡県',41:'佐賀県',42:'長崎県',43:'熊本県',44:'大分県',
+  45:'宮崎県',46:'鹿児島県',47:'沖縄県',
+};
+const PREF_NAME_SET = new Set(Object.values(PREF_NAMES));
+
+// ============================================================
+//  純粋ユーティリティ（DOM非依存 / テスト可能）
+// ============================================================
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// 外部由来文字列のHTMLエスケープ（XSS対策の本命）
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+    { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]
+  ));
+}
+// P2PQuakeの日時 "YYYY/MM/DD ..." → "YYYY-MM-DD"（type=date / 比較用に正規化）
+function normDay(t) { return (t || '').slice(0,10).replace(/\//g,'-'); }
+
+function shindoInfo(s) { return SHINDO_MAP[s] || null; }
+function validCoord(v) { return typeof v === 'number' && v !== CONFIG.coordUnknown && Number.isFinite(v); }
+function validMag(m)   { return Number.isFinite(m) && m >= 0; }
+
+function magBin(m) {
+  for (const b of MAG_BINS) { if (m >= b.min && m < b.max) return b; }
+  return MAG_BINS[MAG_BINS.length - 1];
+}
+function magColor(m) { return magBin(m).color; }
+
+function magBadge(m) {
+  const c = magColor(m);
+  return `<span class="mag-badge" style="background:${c}1f;color:${c}">${m.toFixed(1)}</span>`;
+}
+function shindoBadge(scale) {
+  const i = shindoInfo(scale);
+  if (!i) return '<span style="color:#94a3b8">—</span>';
+  return `<span class="shindo-badge" style="background:${i.bg};color:${i.color}">${escapeHtml(i.short)}</span>`;
+}
+function formatTime(str) { return str ? str.replace(/\.\d+$/, '') : '—'; }
+
+// 観測点(points)の最大震度も加味した「実効最大震度」
+function effectiveMaxScale(d) {
+  let s = (typeof d.earthquake?.maxScale === 'number') ? d.earthquake.maxScale : -1;
+  (d.points || []).forEach(p => { if (typeof p.scale === 'number' && p.scale > s) s = p.scale; });
+  return s;
+}
+
+function extractPrefsFromPoints(points) {
+  const prefs = new Set();
+  (points || []).forEach(p => {
+    if (!p.pref) return;
+    if (typeof p.pref === 'number') {        // 数値コード（将来の別ソース互換用）
+      const n = PREF_NAMES[p.pref]; if (n) prefs.add(n);
+    } else {
+      if (PREF_NAME_SET.has(p.pref)) { prefs.add(p.pref); return; }
+      const m = p.pref.match(/^(.+?[都道府県])/);
+      if (m && PREF_NAME_SET.has(m[1])) prefs.add(m[1]);
+    }
+  });
+  return prefs;
+}
+// 震源地名から都道府県を抽出（"岩手県沖"→"岩手県"。海域名"三陸沖"等はnull）
+function prefFromName(name) {
+  if (!name) return null;
+  const m = name.match(/^(.+?[都道府県])/);
+  return (m && PREF_NAME_SET.has(m[1])) ? m[1] : null;
+}
+function getPrefsForQuake(d) {
+  const fp = extractPrefsFromPoints(d.points);
+  if (fp.size > 0) return fp;
+  const fn = prefFromName(d.earthquake?.hypocenter?.name);
+  return fn ? new Set([fn]) : new Set();
+}
+
+// マージ + 重複排除 + イベント統合 + 上限剪定（純粋関数）
+function mergeData(existing, incoming) {
+  // Step1: id重複除去
+  const seenId = new Set(existing.map(d => d.id));
+  const combined = [...existing];
+  (incoming || []).forEach(d => { if (d && !seenId.has(d.id)) { seenId.add(d.id); combined.push(d); } });
+
+  // Step2: 同一地震の複数レコード（速報→修正）を統合。キー=発生時刻+震源地名、最新idを残す
+  const eventMap = new Map();
+  combined.forEach(d => {
+    const t = d.earthquake?.time || '';
+    const n = d.earthquake?.hypocenter?.name || '';
+    const key = (t || n) ? (t + '|' + n) : ('id|' + d.id); // 時刻も名前も無ければidで個別扱い
+    const prev = eventMap.get(key);
+    if (!prev || String(d.id) > String(prev.id)) eventMap.set(key, d);
+  });
+
+  let merged = [...eventMap.values()];
+  merged.sort((a,b) => (b.earthquake?.time || '').localeCompare(a.earthquake?.time || ''));
+  if (merged.length > CONFIG.maxStored) merged = merged.slice(0, CONFIG.maxStored); // 古い順に剪定
+  return merged;
+}
+
+// ============================================================
+//  localStorage（成否を返す / 容量超過に対応）
+// ============================================================
+function isQuotaError(e) {
+  return e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED' || e.code === 22);
+}
+// 保存。容量超過時は古いデータを段階的に剪定して再試行。実際に保存できた配列を返す。
+function saveToStorage(data) {
+  let arr = data;
+  while (true) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
+      localStorage.setItem(STORAGE_FETCH_KEY, new Date().toISOString());
+      return arr;
+    } catch (e) {
+      if (isQuotaError(e) && arr.length > 200) {
+        arr = arr.slice(0, Math.floor(arr.length * 0.8)); // 古い順に2割剪定
+        showBanner(`保存容量を超えたため古いデータを剪定しました（残り${arr.length}件）。バックアップはエクスポートを。`, 'warn');
+        continue;
+      }
+      showBanner('データの保存に失敗しました（容量超過の可能性）。エクスポートで手元に保存してください。', 'error');
+      return arr;
+    }
+  }
+}
+function loadFromStorage() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(d => d && typeof d === 'object' && d.earthquake); // 壊れた要素を除去
+  } catch (e) { return []; }
+}
+function getLastFetchTime() {
+  const s = localStorage.getItem(STORAGE_FETCH_KEY);
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// ============================================================
+//  状態 / 要素キャッシュ
+// ============================================================
+let allData = [], filteredData = [], markers = [];
+let selectedId = null;
+let userDateFrom = false, userDateTo = false; // ユーザーが日付を手動変更したか
+let timelineMode = 'bar';
+let timelineChart = null;
+
+const el = {};
+['banner','limit-select','date-from','date-to','min-mag-select','min-shindo-select',
+ 'pref-select','japan-only','clear-filter','status','quake-tbody','stat-total','stat-stored',
+ 'stat-max-mag','stat-max-mag-loc','stat-avg-mag','stat-latest-mag','stat-latest-time',
+ 'shindo-grid','mag-bars','auto-status','fetch-btn','export-btn','import-btn','import-file',
+ 'tgl-month','tgl-bar','detail-popup','detail-title','detail-intensity-list','detail-close'
+].forEach(id => { el[id] = document.getElementById(id); });
+
+const hasLeaflet = typeof L !== 'undefined';
+const hasChart   = typeof Chart !== 'undefined';
+
+// ============================================================
+//  通知バナー
+// ============================================================
+let bannerTimer = null;
+function showBanner(msg, type = 'info', autoHide = (type === 'info')) {
+  if (!el.banner) return;
+  el.banner.className = type;
+  el.banner.hidden = false;
+  el.banner.innerHTML = '';
+  const span = document.createElement('span');
+  span.textContent = msg;
+  const actions = document.createElement('div');
+  actions.className = 'banner-actions';
+  if (type === 'error' || type === 'warn') {
+    const retry = document.createElement('button');
+    retry.textContent = '再取得';
+    retry.addEventListener('click', () => loadData(false));
+    actions.appendChild(retry);
+  }
+  const close = document.createElement('button');
+  close.textContent = '×';
+  close.setAttribute('aria-label','閉じる');
+  close.addEventListener('click', hideBanner);
+  actions.appendChild(close);
+  el.banner.appendChild(span);
+  el.banner.appendChild(actions);
+  clearTimeout(bannerTimer);
+  if (autoHide) bannerTimer = setTimeout(hideBanner, 6000);
+}
+function hideBanner() { if (el.banner) el.banner.hidden = true; }
+
+function updateAutoStatus() {
+  const last = getLastFetchTime();
+  if (!last) { el['auto-status'].textContent = ''; return; }
+  const next = new Date(last.getTime() + CONFIG.autoIntervalMs);
+  el['auto-status'].textContent =
+    `最終取得: ${last.toLocaleDateString('ja-JP')} ／ 次回(開いた時)自動: ${next.toLocaleDateString('ja-JP')}`;
+}
+
+// ============================================================
+//  地図
+// ============================================================
+let map = null, markerGroup = null;
+if (hasLeaflet) {
+  map = L.map('map').setView([36.5, 137.5], 5);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors', maxZoom: 18,
+  }).addTo(map);
+  markerGroup = L.layerGroup().addTo(map);
+
+  // 色だけに頼らないための凡例
+  const legend = L.control({ position: 'bottomleft' });
+  legend.onAdd = function () {
+    const div = L.DomUtil.create('div', 'map-legend');
+    div.innerHTML = '<div class="ml-title">マグニチュード（円の色・大きさ）</div>' +
+      MAG_BINS.map(b => `<div class="ml-row"><span class="ml-dot" style="background:${b.color}"></span>${b.label}</div>`).join('');
+    return div;
+  };
+  legend.addTo(map);
+} else {
+  showBanner('地図ライブラリ(Leaflet)の読み込みに失敗しました。表・統計のみ表示します。', 'error', false);
+}
+
+// ============================================================
+//  データ取得（タイムアウト + リトライ + 部分失敗許容）
+// ============================================================
+async function fetchJsonWithRetry(url) {
+  let lastErr;
+  for (let attempt = 0; attempt <= CONFIG.fetchRetries; attempt++) {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), CONFIG.fetchTimeoutMs);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(tid);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      if (!Array.isArray(json)) throw new Error('想定外のレスポンス形式');
+      return json;
+    } catch (e) {
+      clearTimeout(tid);
+      lastErr = (e.name === 'AbortError') ? new Error('タイムアウト') : e;
+      if (attempt < CONFIG.fetchRetries) await sleep(1000 * Math.pow(2, attempt));
+    }
+  }
+  throw lastErr;
+}
+
+async function loadData(silent = false) {
+  const total = parseInt(el['limit-select'].value, 10) || CONFIG.defaultLimit;
+  el['fetch-btn'].disabled = true;
+  el['fetch-btn'].textContent = '取得中...';
+  if (!silent) el.status.textContent = 'APIに接続中...';
+
+  try {
+    const pages = Math.ceil(total / CONFIG.apiPageSize);
+    const reqs = [];
+    for (let i = 0; i < pages; i++) {
+      const offset = i * CONFIG.apiPageSize;
+      const limit  = Math.min(CONFIG.apiPageSize, total - offset);
+      reqs.push(fetchJsonWithRetry(`${CONFIG.apiBase}?codes=${CONFIG.apiCodes}&limit=${limit}&offset=${offset}`));
+    }
+    const settled = await Promise.allSettled(reqs);
+    const okPages = settled.filter(s => s.status === 'fulfilled').map(s => s.value);
+    const failed  = settled.length - okPages.length;
+    const results = okPages.flat().filter(x => x && typeof x === 'object');
+
+    if (!results.length) {
+      throw (settled.find(s => s.status === 'rejected')?.reason) || new Error('データを取得できませんでした');
+    }
+    if (failed) {
+      showBanner(`一部のページ取得に失敗しました（${failed}/${settled.length}）。取得できた分のみ反映します。`, 'warn');
+    } else {
+      hideBanner();
+    }
+
+    allData = mergeData(loadFromStorage(), results);
+    allData = saveToStorage(allData);
+    updateAutoStatus();
+    updatePrefSelect();
+    updateDateRange();
+    el['stat-stored'].textContent = allData.length;
+    el.status.textContent = `${results.length}件取得・蓄積${allData.length}件 (${new Date().toLocaleTimeString('ja-JP')})`;
+    applyFilter();
+  } catch (e) {
+    const msg = `取得エラー: ${e.message}`;
+    el.status.textContent = msg;
+    // silent(自動)取得でも失敗はバナーに残す
+    showBanner(msg + '（ネットワークやAPIを確認のうえ再取得してください）', 'error', false);
+  } finally {
+    el['fetch-btn'].disabled = false;
+    el['fetch-btn'].textContent = 'データを取得';
+  }
+}
+
+function updatePrefSelect() {
+  const prefSet = new Set();
+  allData.forEach(d => getPrefsForQuake(d).forEach(p => prefSet.add(p)));
+  const cur = el['pref-select'].value;
+  el['pref-select'].innerHTML = '<option value="">すべて</option>' +
+    [...prefSet].sort().map(p => {
+      const e = escapeHtml(p);
+      return `<option value="${e}"${p === cur ? ' selected' : ''}>${e}</option>`;
+    }).join('');
+}
+
+// 期間の既定値。ユーザーが手動変更していない側は最新範囲に追従させる（蓄積で取りこぼさない）
+function updateDateRange() {
+  if (!allData.length) return;
+  const days = allData.map(d => normDay(d.earthquake?.time)).filter(Boolean).sort();
+  if (!days.length) return;
+  const oldest = days[0], newest = days[days.length - 1];
+  if (!userDateFrom) el['date-from'].value = oldest;
+  if (!userDateTo)   el['date-to'].value   = newest;
+}
+
+// ============================================================
+//  フィルター
+// ============================================================
+function applyFilter() {
+  const minMag    = parseFloat(el['min-mag-select'].value);
+  const minShind  = parseInt(el['min-shindo-select'].value, 10);
+  const prefVal   = el['pref-select'].value;
+  const fromVal   = el['date-from'].value;
+  const toVal     = el['date-to'].value;
+  const japanOnly = el['japan-only'].checked;
+  const b = CONFIG.japanBounds;
+
+  filteredData = allData.filter(d => {
+    const eq = d.earthquake;
+    if (!eq || !eq.hypocenter) return false;
+    const h = eq.hypocenter;
+    const m = h.magnitude;
+    if (!validMag(m) || m < minMag) return false;
+    if (minShind >= 0 && effectiveMaxScale(d) < minShind) return false;
+    if (fromVal || toVal) {
+      const t = normDay(eq.time);
+      if (fromVal && t < fromVal) return false;
+      if (toVal   && t > toVal)   return false;
+    }
+    if (japanOnly) {
+      const lat = h.latitude, lon = h.longitude;
+      if (!validCoord(lat) || !validCoord(lon)) return false;
+      if (lat < b.latMin || lat > b.latMax || lon < b.lonMin || lon > b.lonMax) return false;
+    }
+    if (prefVal && !getPrefsForQuake(d).has(prefVal)) return false;
+    return true;
+  });
+
+  // 選択中の地震がフィルタ結果に残っていれば維持、外れたら閉じる
+  if (selectedId != null && !filteredData.some(d => d.id === selectedId)) {
+    selectedId = null;
+    closeDetail();
+  }
+  renderAll();
+}
+
+function clearFilters() {
+  el['min-mag-select'].value = '0';
+  el['min-shindo-select'].value = '-1';
+  el['pref-select'].value = '';
+  el['japan-only'].checked = true;
+  userDateFrom = userDateTo = false;
+  updateDateRange();
+  applyFilter();
+}
+
+// ============================================================
+//  描画
+// ============================================================
+function renderAll() { renderMap(); renderTable(); renderStats(); renderTimeline(); }
+
+function idToIndex(id) { return filteredData.findIndex(d => d.id === id); }
+
+function renderMap() {
+  if (!map) return;
+  markerGroup.clearLayers();
+  markers = [];
+  filteredData.forEach((d, i) => {
+    const h = d.earthquake.hypocenter;
+    if (!validCoord(h?.latitude) || !validCoord(h?.longitude)) { markers.push(null); return; }
+    const m = h.magnitude;
+    const color = magColor(m);
+    const circle = L.circleMarker([h.latitude, h.longitude], {
+      radius: Math.max(5, m * 5), fillColor: color, color, weight: 1, opacity: 0.85, fillOpacity: 0.45,
+    });
+    const depth  = (h.depth >= 0) ? `${h.depth}km` : '不明';
+    const eScale = effectiveMaxScale(d);
+    const shindo = (eScale >= 10) ? (shindoInfo(eScale)?.label || '—') : '—';
+    circle.bindPopup(
+      `<b>${escapeHtml(h.name || '不明')}</b><br>${escapeHtml(formatTime(d.earthquake.time))}` +
+      `<br>M <b>${m.toFixed(1)}</b> / 深さ ${escapeHtml(depth)}<br>最大震度: <b>${escapeHtml(shindo)}</b>`
+    );
+    circle.on('click', () => selectQuake(d.id));
+    markerGroup.addLayer(circle);
+    markers.push(circle);
+  });
+}
+
+function renderTable() {
+  if (!filteredData.length) {
+    el['quake-tbody'].innerHTML =
+      '<tr><td colspan="5" class="empty-msg">該当データなし<span class="hint">最小震度・最小M・期間などの条件を緩めるか、「フィルター解除」をお試しください。</span></td></tr>';
+    return;
+  }
+  el['quake-tbody'].innerHTML = filteredData.map(d => {
+    const eq = d.earthquake, h = eq.hypocenter;
+    const mag   = validMag(h?.magnitude) ? h.magnitude : null;
+    const depth = (h?.depth ?? -1) >= 0 ? `${h.depth}km` : '—';
+    const eScale = effectiveMaxScale(d);
+    return `<tr data-id="${escapeHtml(d.id)}" tabindex="0" role="button" aria-label="${escapeHtml((h?.name||'不明') + ' ' + formatTime(eq.time))}">
+      <td style="white-space:nowrap;font-size:0.76rem">${escapeHtml(formatTime(eq.time))}</td>
+      <td>${escapeHtml(h?.name || '—')}</td>
+      <td>${mag !== null ? magBadge(mag) : '—'}</td>
+      <td>${escapeHtml(depth)}</td>
+      <td>${shindoBadge(eScale)}</td>
+    </tr>`;
+  }).join('');
+  // 選択状態を復元
+  if (selectedId != null) {
+    const row = el['quake-tbody'].querySelector(`tr[data-id="${cssEscape(selectedId)}"]`);
+    if (row) row.classList.add('selected');
+  }
+}
+
+function cssEscape(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/"/g,'\\"'); }
+
+function selectQuake(id) {
+  selectedId = id;
+  const idx = idToIndex(id);
+  el['quake-tbody'].querySelectorAll('tr').forEach(r => r.classList.remove('selected'));
+  const row = el['quake-tbody'].querySelector(`tr[data-id="${cssEscape(id)}"]`);
+  if (row) { row.classList.add('selected'); row.scrollIntoView({ block: 'nearest' }); }
+  const d = filteredData[idx];
+  if (!d) return;
+  const h = d.earthquake.hypocenter;
+  if (map && validCoord(h?.latitude) && validCoord(h?.longitude)) {
+    map.setView([h.latitude, h.longitude], 8, { animate: true });
+    markers[idx]?.openPopup();
+  }
+  showDetailPopup(d);
+}
+
+function showDetailPopup(d) {
+  const eq = d.earthquake, h = eq.hypocenter;
+  el['detail-title'].textContent =
+    `${h?.name || '不明'} M${validMag(h?.magnitude) ? h.magnitude.toFixed(1) : '—'}  ${formatTime(eq.time)}`;
+  const groups = {};
+  (d.points || []).forEach(p => {
+    if (typeof p.scale !== 'number' || p.scale < 10) return; // 震度1未満/不明(-1)は除外
+    (groups[p.scale] = groups[p.scale] || []).push(p.addr || '');
+  });
+  const scales = Object.keys(groups).map(Number).sort((a,b) => b - a);
+  if (!scales.length) {
+    el['detail-intensity-list'].innerHTML = '<div style="font-size:0.8rem;color:#94a3b8">震度観測点データなし</div>';
+  } else {
+    el['detail-intensity-list'].innerHTML = scales.map(s => {
+      const info = shindoInfo(s);
+      const badge = info
+        ? `<span class="shindo-badge ii-shindo" style="background:${info.bg};color:${info.color}">${escapeHtml(info.label)}</span>`
+        : `<span class="ii-shindo">${escapeHtml(s)}</span>`;
+      const prefMap = {};
+      groups[s].forEach(addr => {
+        const mm = addr.match(/^(.+?[都道府県])/);
+        const pref = mm ? mm[1] : addr;
+        const rest = addr.replace(/^.+?[都道府県]\s*/, '');
+        (prefMap[pref] = prefMap[pref] || []);
+        if (rest) prefMap[pref].push(rest);
+      });
+      const prefStr = Object.entries(prefMap)
+        .map(([pref, areas]) => `${pref}(${areas.slice(0,3).join('・')}${areas.length > 3 ? '…' : ''})`)
+        .join(' ');
+      return `<div class="intensity-item">${badge}<span class="ii-prefs">${escapeHtml(prefStr)}</span></div>`;
+    }).join('');
+  }
+  el['detail-popup'].classList.add('open');
+}
+function closeDetail() { el['detail-popup'].classList.remove('open'); }
+
+function renderStats() {
+  const data = filteredData;
+  el['stat-total'].textContent = data.length;
+  el['stat-stored'].textContent = allData.length;
+  const wm = data.filter(d => validMag(d.earthquake?.hypocenter?.magnitude));
+  if (!wm.length) {
+    ['stat-max-mag','stat-avg-mag','stat-latest-mag'].forEach(id => el[id].textContent = '—');
+    el['stat-max-mag-loc'].textContent = '—';
+    el['stat-latest-time'].textContent = '—';
+    el['shindo-grid'].innerHTML = '';
+    el['mag-bars'].innerHTML = '';
+    return;
+  }
+  const mags = wm.map(d => d.earthquake.hypocenter.magnitude);
+  const maxM = Math.max(...mags);
+  const maxD = wm.find(d => d.earthquake.hypocenter.magnitude === maxM);
+  el['stat-max-mag'].textContent = `M${maxM.toFixed(1)}`;
+  el['stat-max-mag-loc'].textContent = maxD?.earthquake?.hypocenter?.name || '—';
+  el['stat-avg-mag'].textContent = `M${(mags.reduce((a,b) => a + b, 0) / mags.length).toFixed(1)}`;
+
+  // 最新地震はソート順に依存せず明示的に算出
+  const latest = data.reduce((a, b) =>
+    (b.earthquake?.time || '') > (a?.earthquake?.time || '') ? b : a, data[0]);
+  const lm = latest?.earthquake?.hypocenter?.magnitude;
+  el['stat-latest-mag'].textContent = validMag(lm) ? `M${lm.toFixed(1)}` : '—';
+  el['stat-latest-time'].textContent = formatTime(latest?.earthquake?.time || '');
+
+  // 震度タイル（実効最大震度で集計。推定値・想定外コードは「他」へ）
+  const sc = {}; let other = 0;
+  data.forEach(d => {
+    const s = effectiveMaxScale(d);
+    if (s < 10) return;
+    if (SHINDO_TILE_KEYS.includes(s)) sc[s] = (sc[s] || 0) + 1;
+    else other++;
+  });
+  let tiles = SHINDO_TILE_KEYS.map(s => {
+    const info = shindoInfo(s), cnt = sc[s] || 0, tier = SHINDO_TIER[s] || 't-sm';
+    return `<div class="shindo-cell ${tier}${cnt === 0 ? ' zero' : ''}" style="background:${info.bg};color:${info.color}">
+      <div class="sc-label">${escapeHtml(info.short)}</div><div class="sc-count">${cnt}</div></div>`;
+  }).join('');
+  if (other > 0) {
+    tiles += `<div class="shindo-cell t-sm" style="grid-column:1/-1;background:#e2e8f0;color:#475569" title="推定値などその他">
+      <div class="sc-label">他(推定)</div><div class="sc-count">${other}</div></div>`;
+  }
+  el['shindo-grid'].innerHTML = tiles;
+
+  // Mバー（共有MAG_BINSで分類 = タイムラインと一致）
+  const counts = MAG_BINS.map(b => mags.filter(m => m >= b.min && m < b.max).length);
+  const maxCnt = Math.max(...counts, 1);
+  el['mag-bars'].innerHTML = MAG_BINS.map((b, i) => {
+    const cnt = counts[i];
+    return `<div class="mag-bar"><span class="mb-label">${b.label}</span>
+      <div class="mb-bg"><div class="mb-fill" style="width:${(cnt / maxCnt * 100).toFixed(0)}%;background:${b.color}"></div></div>
+      <span class="mb-count">${cnt}</span></div>`;
+  }).join('');
+}
+
+// ============================================================
+//  タイムライン（Chartは再利用してupdate）
+// ============================================================
+function buildTimelineData() {
+  const data = filteredData.filter(d => d.earthquake?.time && validMag(d.earthquake?.hypocenter?.magnitude));
+  const agg = {};
+  data.forEach(d => {
+    const day = normDay(d.earthquake.time);
+    const key = (timelineMode === 'month') ? day.slice(0,7) + '-01' : day;
+    if (!agg[key]) agg[key] = {};
+    const bk = magBin(d.earthquake.hypocenter.magnitude).key;
+    agg[key][bk] = (agg[key][bk] || 0) + 1;
+  });
+  const keys = Object.keys(agg).sort();
+  const labels = keys.map(k => new Date(k));
+  const datasets = MAG_BINS.map(b => ({
+    label: b.label, backgroundColor: b.color, stack: 'a', barPercentage: 0.85,
+    data: keys.map(k => agg[k][b.key] || 0),
+  }));
+  return { labels, datasets };
+}
+
+function renderTimeline() {
+  if (!hasChart) return;
+  const { labels, datasets } = buildTimelineData();
+  const unit = (timelineMode === 'month') ? 'month' : 'day';
+  const tfmt = (timelineMode === 'month') ? 'yyyy/MM' : 'yyyy/MM/dd';
+  const ctx = document.getElementById('timeline-chart').getContext('2d');
+
+  if (timelineChart) {
+    timelineChart.data.labels = labels;
+    timelineChart.data.datasets = datasets;
+    timelineChart.options.scales.x.time.unit = unit;
+    timelineChart.options.scales.x.time.tooltipFormat = tfmt;
+    timelineChart.update('none');
+    return;
+  }
+  timelineChart = new Chart(ctx, {
+    type: 'bar',
+    data: { labels, datasets },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'right', labels: { boxWidth: 10, font: { size: 11 } } },
+        tooltip: {
+          mode: 'index',
+          callbacks: { footer: items => `合計: ${items.reduce((s,i) => s + i.raw, 0)}件` },
+        },
+      },
+      scales: {
+        x: {
+          type: 'time',
+          offset: true, // 棒を各日付ラベルの真上に中央寄せする
+          time: { unit, tooltipFormat: tfmt, displayFormats: { month: 'yyyy/M', day: 'M/d' } },
+          stacked: true, grid: { display: false, offset: true },
+          ticks: { font: { size: 11 }, color: '#64748b', maxTicksLimit: 18 },
+        },
+        y: {
+          stacked: true, beginAtZero: true,
+          title: { display: true, text: '件数', font: { size: 11 }, color: '#64748b' },
+          grid: { color: '#f1f5f9' },
+          ticks: { font: { size: 11 }, color: '#64748b', precision: 0 },
+        },
+      },
+    },
+  });
+}
+
+function setTimelineMode(mode) {
+  timelineMode = mode;
+  el['tgl-month'].classList.toggle('active', mode === 'month');
+  el['tgl-bar'].classList.toggle('active', mode === 'bar');
+  renderTimeline();
+}
+
+// ============================================================
+//  エクスポート / インポート（localStorage消失への保険）
+// ============================================================
+function exportData() {
+  if (!allData.length) { showBanner('エクスポートするデータがありません。', 'info'); return; }
+  const blob = new Blob([JSON.stringify(allData)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().slice(0,10);
+  a.href = url; a.download = `jishin-backup-${stamp}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  showBanner(`${allData.length}件をエクスポートしました。`, 'info');
+}
+function importData(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const parsed = JSON.parse(reader.result);
+      if (!Array.isArray(parsed)) throw new Error('配列形式のJSONではありません');
+      const valid = parsed.filter(d => d && typeof d === 'object' && d.earthquake);
+      const before = allData.length;
+      allData = mergeData(allData, valid);
+      allData = saveToStorage(allData);
+      updatePrefSelect(); updateDateRange();
+      el['stat-stored'].textContent = allData.length;
+      applyFilter();
+      showBanner(`インポート完了: ${valid.length}件読込・蓄積${before}→${allData.length}件。`, 'info');
+    } catch (e) {
+      showBanner(`インポート失敗: ${e.message}`, 'error', false);
+    }
+  };
+  reader.onerror = () => showBanner('ファイルの読み込みに失敗しました。', 'error', false);
+  reader.readAsText(file);
+}
+
+// ============================================================
+//  イベント結線（インライン onclick を廃止）
+// ============================================================
+function onUserDateChange(which) {
+  if (which === 'from') userDateFrom = true; else userDateTo = true;
+  applyFilter();
+}
+el['fetch-btn'].addEventListener('click', () => loadData(false));
+el['export-btn'].addEventListener('click', exportData);
+el['import-btn'].addEventListener('click', () => el['import-file'].click());
+el['import-file'].addEventListener('change', e => { if (e.target.files[0]) importData(e.target.files[0]); e.target.value = ''; });
+el['min-mag-select'].addEventListener('change', applyFilter);
+el['min-shindo-select'].addEventListener('change', applyFilter);
+el['pref-select'].addEventListener('change', applyFilter);
+el['japan-only'].addEventListener('change', applyFilter);
+el['date-from'].addEventListener('change', () => onUserDateChange('from'));
+el['date-to'].addEventListener('change', () => onUserDateChange('to'));
+el['clear-filter'].addEventListener('click', clearFilters);
+el['tgl-month'].addEventListener('click', () => setTimelineMode('month'));
+el['tgl-bar'].addEventListener('click', () => setTimelineMode('bar'));
+el['detail-close'].addEventListener('click', closeDetail);
+
+// テーブル行: クリック + キーボード（Enter/Space）。イベント委譲。
+el['quake-tbody'].addEventListener('click', e => {
+  const tr = e.target.closest('tr[data-id]'); if (tr) selectQuake(tr.dataset.id);
+});
+el['quake-tbody'].addEventListener('keydown', e => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const tr = e.target.closest('tr[data-id]'); if (tr) { e.preventDefault(); selectQuake(tr.dataset.id); }
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetail(); });
+window.addEventListener('resize', () => { if (map) map.invalidateSize(); });
+
+// 件数セレクトを CONFIG から生成（二重管理を排除）
+el['limit-select'].innerHTML = CONFIG.limitOptions
+  .map(n => `<option value="${n}"${n === CONFIG.defaultLimit ? ' selected' : ''}>${n}件</option>`).join('');
+
+// ============================================================
+//  起動処理
+// ============================================================
+window.addEventListener('load', () => {
+  if (map) map.invalidateSize();
+
+  const stored = loadFromStorage();
+  if (stored.length) {
+    allData = mergeData([], stored);                 // 既存データも重複除去を通す
+    if (allData.length !== stored.length) saveToStorage(allData); // 重複があれば上書き保存
+    el['stat-stored'].textContent = allData.length;
+    updatePrefSelect();
+    updateDateRange();
+    el.status.textContent = `蓄積データ ${allData.length}件を復元`;
+  } else {
+    el.status.textContent = '初回起動 — 「データを取得」を押してください';
+  }
+  updateAutoStatus();
+
+  // 自動取得（このページを開いた時点で前回から1週間以上経過していれば実行）
+  const last = getLastFetchTime();
+  const shouldAutoFetch = !last || (Date.now() - last.getTime() > CONFIG.autoIntervalMs);
+  if (shouldAutoFetch) {
+    el.status.textContent = last ? '前回取得から1週間以上経過 — 自動取得中...' : '初回: 自動取得中...';
+    loadData(true);
+  } else {
+    applyFilter(); // 既存データを描画（自動取得時は取得後に描画される）
+  }
+});
+
+// ============================================================
+//  テスト用に純粋関数を公開 + ?test で簡易セルフテスト
+// ============================================================
+window.EQ = { normDay, magBin, magColor, prefFromName, extractPrefsFromPoints, effectiveMaxScale, mergeData, escapeHtml };
+
+function selfTest() {
+  const log = [];
+  const assert = (n, c) => log.push((c ? 'PASS' : 'FAIL') + ': ' + n);
+  assert('normDay slash→ISO', normDay('2026/06/28 05:21:00') === '2026-06-28');
+  assert('magBin境界', magBin(7.2).key === 'm7' && magBin(6).key === 'm6' && magBin(2.9).key === 'm0');
+  assert('prefFromName 沖→県', prefFromName('岩手県沖') === '岩手県');
+  assert('prefFromName 海域→null', prefFromName('三陸沖') === null);
+  assert('escapeHtml', escapeHtml('<b>"&\'') === '&lt;b&gt;&quot;&amp;&#39;');
+  const merged = mergeData([], [
+    { id:'a', earthquake:{ time:'2026/06/01 00:00:00', hypocenter:{ name:'X' } } },
+    { id:'b', earthquake:{ time:'2026/06/01 00:00:00', hypocenter:{ name:'X' } } },
+    { id:'c', earthquake:{ time:'2026/05/01 00:00:00', hypocenter:{ name:'Y' } } },
+  ]);
+  assert('mergeData イベント統合', merged.length === 2 && merged.find(d => d.earthquake.hypocenter.name === 'X').id === 'b');
+  assert('effectiveMaxScale points反映', effectiveMaxScale({ earthquake:{ maxScale:30 }, points:[{ scale:50 }] }) === 50);
+  console.log('%c[self-test]\n' + log.join('\n'), 'font-family:monospace');
+  return log;
+}
+if (location.search.includes('test')) window.addEventListener('load', selfTest);
+</script>
+</body>
+</html>
