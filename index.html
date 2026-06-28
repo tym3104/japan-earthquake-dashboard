@@ -24,7 +24,7 @@
     script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com;
     style-src 'self' 'unsafe-inline' https://unpkg.com;
     img-src 'self' data: https://*.tile.openstreetmap.org https://*.openstreetmap.org;
-    connect-src https://api.p2pquake.net;
+    connect-src 'self' https://api.p2pquake.net;
     font-src 'self' data:;">
 
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="anonymous" />
@@ -363,6 +363,7 @@
 const CONFIG = {
   autoIntervalMs: 7 * 24 * 60 * 60 * 1000, // 自動取得の間隔（1週間）
   apiBase:        'https://api.p2pquake.net/v2/history',
+  dataUrl:        './data/earthquakes.json',  // 週次ジョブが更新する共有の正本データ（初回訪問者でも履歴が見える）
   apiCodes:       551,                      // 551 = 地震情報
   apiPageSize:    100,                      // P2PQuake APIの1回の最大件数
   japanBounds:    { latMin: 20, latMax: 48, lonMin: 122, lonMax: 156 }, // 日本近隣BBox
@@ -522,12 +523,14 @@ function isQuotaError(e) {
   return e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED' || e.code === 22);
 }
 // 保存。容量超過時は古いデータを段階的に剪定して再試行。実際に保存できた配列を返す。
-function saveToStorage(data) {
+// touchFetchTime=false の場合は「最終取得時刻」を更新しない（起動時の共有データ統合など、
+// API取得ではない保存で自動取得タイマーをリセットしないため）。
+function saveToStorage(data, touchFetchTime = true) {
   let arr = data;
   while (true) {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
-      localStorage.setItem(STORAGE_FETCH_KEY, new Date().toISOString());
+      if (touchFetchTime) localStorage.setItem(STORAGE_FETCH_KEY, new Date().toISOString());
       return arr;
     } catch (e) {
       if (isQuotaError(e) && arr.length > 200) {
@@ -553,6 +556,22 @@ function getLastFetchTime() {
   if (!s) return null;
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
+}
+
+// 週次ジョブが更新する共有の正本データ（リポジトリ内JSON）を読み込む。
+// 取得できなくても（ローカルでfile://を開いた等）致命的ではないので空配列を返す。
+async function fetchRepoData() {
+  try {
+    // no-cache: 毎回サーバーへ条件付きリクエスト（ETag/304）で鮮度を確認しつつ、
+    // 変更がなければ本体を再ダウンロードしない（no-store は毎回フル取得になり非効率）。
+    const res = await fetch(CONFIG.dataUrl, { cache: 'no-cache' });
+    if (!res.ok) return [];
+    const json = await res.json();
+    if (!Array.isArray(json)) return [];
+    return json.filter(d => d && typeof d === 'object' && d.earthquake);
+  } catch (e) {
+    return []; // file://やオフライン等。ローカル蓄積・ライブAPIで継続。
+  }
 }
 
 // ============================================================
@@ -1102,30 +1121,44 @@ el['limit-select'].innerHTML = CONFIG.limitOptions
 // ============================================================
 //  起動処理
 // ============================================================
-window.addEventListener('load', () => {
+window.addEventListener('load', async () => {
   if (map) map.invalidateSize();
 
   const stored = loadFromStorage();
-  if (stored.length) {
-    allData = mergeData([], stored);                 // 既存データも重複除去を通す
-    if (allData.length !== stored.length) saveToStorage(allData); // 重複があれば上書き保存
+  el.status.textContent = '共有データを読み込み中...';
+  // 共有の正本データ（週次ジョブ更新）を土台に、各自のブラウザ蓄積を統合。
+  // これにより初回訪問者でも過去の蓄積履歴が見える（誰のブラウザにも依存しない）。
+  const repo = await fetchRepoData();
+  allData = mergeData(repo, stored);
+
+  if (allData.length) {
+    // 統合結果をローカルにも保存（共有履歴を各自のブラウザへ取り込む）。
+    // ただし「最終取得時刻」は更新しない＝この後のライブ自動取得判定を妨げない。
+    // 共有データがあれば、件数が同じでも内容が差し替わりうる（速報→修正の統合）ため保存する。
+    if (repo.length || allData.length !== stored.length) allData = saveToStorage(allData, false);
     el['stat-stored'].textContent = allData.length;
     updatePrefSelect();
     updateDateRange();
-    el.status.textContent = `蓄積データ ${allData.length}件を復元`;
+    const parts = [];
+    if (repo.length)   parts.push(`共有${repo.length}件`);
+    if (stored.length) parts.push(`ローカル${stored.length}件`);
+    el.status.textContent = `${parts.join(' + ') || 'データ'}を統合（計${allData.length}件）`;
   } else {
     el.status.textContent = '初回起動 — 「データを取得」を押してください';
   }
   updateAutoStatus();
 
-  // 自動取得（このページを開いた時点で前回から1週間以上経過していれば実行）
+  // まず手元のデータ（共有＋ローカル）を即描画。これにより、この後のライブ取得が
+  // 遅延・失敗しても、蓄積済みのデータが必ず表示される。
+  applyFilter();
+
+  // 自動取得（このページを開いた時点で前回から1週間以上経過していれば実行）。
+  // 成功すれば loadData 内で再描画され最新が上乗せされる。
   const last = getLastFetchTime();
   const shouldAutoFetch = !last || (Date.now() - last.getTime() > CONFIG.autoIntervalMs);
   if (shouldAutoFetch) {
-    el.status.textContent = last ? '前回取得から1週間以上経過 — 自動取得中...' : '初回: 自動取得中...';
+    el.status.textContent = last ? '前回取得から1週間以上経過 — 最新を取得中...' : '最新データを取得中...';
     loadData(true);
-  } else {
-    applyFilter(); // 既存データを描画（自動取得時は取得後に描画される）
   }
 });
 

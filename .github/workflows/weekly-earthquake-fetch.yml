@@ -1,0 +1,66 @@
+name: Weekly earthquake data fetch
+
+# 週次で P2PQuake API から地震データを取得し、data/earthquakes.json を更新して push する。
+# GitHub Actions のランナーはネットワーク制限がなく api.p2pquake.net に到達できるため、
+# Claude Code on the web の環境ポリシー（外部APIブロック）に依存せず確実に動作する。
+
+on:
+  schedule:
+    # 毎週月曜 00:00 UTC（= 月曜 09:00 JST）。cron は UTC 基準。
+    - cron: '0 0 * * 1'
+  workflow_dispatch:        # 手動実行も可能（Actionsタブの「Run workflow」）
+    inputs:
+      span_days:
+        description: 'カバーする期間（日）。既定 10。初回バックフィルは大きめに'
+        required: false
+        default: '10'
+
+# 同時実行を1本に制限（手動とスケジュールが重なっても競合しない）
+concurrency:
+  group: weekly-earthquake-fetch
+  cancel-in-progress: false
+
+permissions:
+  contents: write          # data/earthquakes.json を commit/push するため
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # push前の rebase に十分な履歴を確保
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch & merge earthquake data
+        env:
+          SPAN_DAYS: ${{ github.event.inputs.span_days || '10' }}
+        run: node scripts/fetch-data.mjs
+
+      - name: Commit & push if changed
+        run: |
+          if git diff --quiet -- data/earthquakes.json; then
+            echo "変更なし — コミットをスキップします。"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/earthquakes.json
+          count=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/earthquakes.json','utf8')).length)")
+          git commit -m "chore: weekly earthquake data update (${count} records)"
+          # main が進んでいた場合の非fast-forward失敗に備え、rebase してから push をリトライ
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "push 成功"
+              exit 0
+            fi
+            echo "push 失敗 — rebase して再試行 ($attempt/3)"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          done
+          echo "push に複数回失敗しました。" >&2
+          exit 1
