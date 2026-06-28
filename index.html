@@ -482,11 +482,14 @@ function prefFromName(name) {
   const m = name.match(/^(.+?[都道府県])/);
   return (m && PREF_NAME_SET.has(m[1])) ? m[1] : null;
 }
-function getPrefsForQuake(d) {
-  const fp = extractPrefsFromPoints(d.points);
-  if (fp.size > 0) return fp;
-  const fn = prefFromName(d.earthquake?.hypocenter?.name);
-  return fn ? new Set([fn]) : new Set();
+// 都道府県の並び順（JISコード順 = 北海道→沖縄のいわゆる「北から南」）
+const PREF_ORDER = {};
+Object.entries(PREF_NAMES).forEach(([code, name]) => { PREF_ORDER[name] = +code; });
+
+// その地震の「震源地の都道府県」（海域名など県に紐づかない場合は null）
+// ※フィルターは観測された全県ではなく震源地の県で判定する（直感に合わせる）
+function quakePref(d) {
+  return prefFromName(d.earthquake?.hypocenter?.name);
 }
 
 // マージ + 重複排除 + イベント統合 + 上限剪定（純粋関数）
@@ -708,10 +711,11 @@ async function loadData(silent = false) {
 
 function updatePrefSelect() {
   const prefSet = new Set();
-  allData.forEach(d => getPrefsForQuake(d).forEach(p => prefSet.add(p)));
+  allData.forEach(d => { const p = quakePref(d); if (p) prefSet.add(p); });
   const cur = el['pref-select'].value;
+  const sorted = [...prefSet].sort((a, b) => (PREF_ORDER[a] || 99) - (PREF_ORDER[b] || 99)); // 北→南
   el['pref-select'].innerHTML = '<option value="">すべて</option>' +
-    [...prefSet].sort().map(p => {
+    sorted.map(p => {
       const e = escapeHtml(p);
       return `<option value="${e}"${p === cur ? ' selected' : ''}>${e}</option>`;
     }).join('');
@@ -756,7 +760,7 @@ function applyFilter() {
       if (!validCoord(lat) || !validCoord(lon)) return false;
       if (lat < b.latMin || lat > b.latMax || lon < b.lonMin || lon > b.lonMax) return false;
     }
-    if (prefVal && !getPrefsForQuake(d).has(prefVal)) return false;
+    if (prefVal && quakePref(d) !== prefVal) return false;
     return true;
   });
 
