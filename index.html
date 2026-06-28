@@ -562,7 +562,9 @@ function getLastFetchTime() {
 // 取得できなくても（ローカルでfile://を開いた等）致命的ではないので空配列を返す。
 async function fetchRepoData() {
   try {
-    const res = await fetch(CONFIG.dataUrl, { cache: 'no-store' });
+    // no-cache: 毎回サーバーへ条件付きリクエスト（ETag/304）で鮮度を確認しつつ、
+    // 変更がなければ本体を再ダウンロードしない（no-store は毎回フル取得になり非効率）。
+    const res = await fetch(CONFIG.dataUrl, { cache: 'no-cache' });
     if (!res.ok) return [];
     const json = await res.json();
     if (!Array.isArray(json)) return [];
@@ -1132,7 +1134,8 @@ window.addEventListener('load', async () => {
   if (allData.length) {
     // 統合結果をローカルにも保存（共有履歴を各自のブラウザへ取り込む）。
     // ただし「最終取得時刻」は更新しない＝この後のライブ自動取得判定を妨げない。
-    if (allData.length !== stored.length) allData = saveToStorage(allData, false);
+    // 共有データがあれば、件数が同じでも内容が差し替わりうる（速報→修正の統合）ため保存する。
+    if (repo.length || allData.length !== stored.length) allData = saveToStorage(allData, false);
     el['stat-stored'].textContent = allData.length;
     updatePrefSelect();
     updateDateRange();

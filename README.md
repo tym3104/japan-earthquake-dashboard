@@ -57,10 +57,18 @@
 `scripts/fetch-data.mjs` が P2PQuake API から取得し、重複排除・イベント統合のうえ
 `data/earthquakes.json` にマージ保存します（ダッシュボードと同一のマージロジック）。
 
+取得は**期間ベース**です。既定では直近10日分をカバーするまでページを遡り、既存データに
+追いついたら打ち切ります（cron間隔の7日より広く取ることで、活発な週に古いレコードが
+取りこぼされるのを防ぎます）。
+
 ```bash
-node scripts/fetch-data.mjs            # 既定で直近300件を取得・マージ
-FETCH_LIMIT=500 node scripts/fetch-data.mjs   # 取得件数を変更
+node scripts/fetch-data.mjs              # 直近10日分をカバー（既定）
+SPAN_DAYS=30 node scripts/fetch-data.mjs # カバー期間を変更（初回バックフィルなど）
+FETCH_LIMIT=500 node scripts/fetch-data.mjs  # 件数固定の旧挙動（手動バックフィル用）
 ```
+
+主な環境変数: `SPAN_DAYS`（カバー期間・既定10）、`MAX_PAGES`（安全上限・既定40＝最大4000件）、
+`MAX_STORED`（蓄積上限・既定5000）。
 
 自動実行は GitHub Actions（`.github/workflows/weekly-earthquake-fetch.yml`）が担当します。
 毎週月曜 09:00 JST に実行され、変更があれば自動コミット・プッシュします。Actions タブから

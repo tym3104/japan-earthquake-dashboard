@@ -10,10 +10,10 @@ on:
     - cron: '0 0 * * 1'
   workflow_dispatch:        # 手動実行も可能（Actionsタブの「Run workflow」）
     inputs:
-      fetch_limit:
-        description: '取得件数（既定 300）'
+      span_days:
+        description: 'カバーする期間（日）。既定 10。初回バックフィルは大きめに'
         required: false
-        default: '300'
+        default: '10'
 
 # 同時実行を1本に制限（手動とスケジュールが重なっても競合しない）
 concurrency:
@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # push前の rebase に十分な履歴を確保
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -37,7 +39,7 @@ jobs:
 
       - name: Fetch & merge earthquake data
         env:
-          FETCH_LIMIT: ${{ github.event.inputs.fetch_limit || '300' }}
+          SPAN_DAYS: ${{ github.event.inputs.span_days || '10' }}
         run: node scripts/fetch-data.mjs
 
       - name: Commit & push if changed
@@ -51,4 +53,14 @@ jobs:
           git add data/earthquakes.json
           count=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/earthquakes.json','utf8')).length)")
           git commit -m "chore: weekly earthquake data update (${count} records)"
-          git push
+          # main が進んでいた場合の非fast-forward失敗に備え、rebase してから push をリトライ
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "push 成功"
+              exit 0
+            fi
+            echo "push 失敗 — rebase して再試行 ($attempt/3)"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          done
+          echo "push に複数回失敗しました。" >&2
+          exit 1

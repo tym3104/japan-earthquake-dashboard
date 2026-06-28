@@ -6,8 +6,14 @@
 //
 //  実行: node scripts/fetch-data.mjs
 //  環境変数:
-//    FETCH_LIMIT  取得件数（既定 300。100件単位でページ分割取得）
-//    MAX_STORED   蓄積上限（既定 5000。超過分は古い順に剪定）
+//    SPAN_DAYS   カバーする期間（既定 10日）。cron間隔(7日)より広く取り、
+//                取りこぼし（活発な週に古いレコードが offset から押し出される）を防ぐ。
+//                取得済みの最古の発生時刻が「今 - SPAN_DAYS」より古くなるまで遡る。
+//    MAX_PAGES   1回の最大ページ数（既定 40 = 最大4000件）。レート制限・暴走対策の安全上限。
+//    MAX_STORED  蓄積上限（既定 5000。超過分は古い順に剪定）。
+//    FETCH_LIMIT （任意）件数固定の旧挙動でこの件数だけ取得（手動バックフィル用）。
+//                指定時は SPAN_DAYS より優先。
+//    DATA_PATH / API_BASE はテスト用のオーバーライド。
 //
 //  ※ ダッシュボード(index.html)の mergeData と同一ロジックで整合を保つ。
 //  ※ Node 18+ のグローバル fetch を使用（依存パッケージ不要）。
@@ -22,18 +28,45 @@ const DATA_PATH = process.env.DATA_PATH
   ? resolve(process.env.DATA_PATH)
   : resolve(__dirname, '..', 'data', 'earthquakes.json');
 
+// 正の整数の環境変数を検証付きで読む（非数値・0以下は既定にフォールバックし警告）
+function intEnv(name, def) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return def;
+  const n = parseInt(raw, 10);
+  if (!Number.isInteger(n) || n <= 0) {
+    console.warn(`環境変数 ${name}="${raw}" は正の整数ではありません。既定 ${def} を使用します。`);
+    return def;
+  }
+  return n;
+}
+
 const CONFIG = {
   apiBase:      process.env.API_BASE || 'https://api.p2pquake.net/v2/history',
   apiCodes:     551,                              // 551 = 地震情報
   apiPageSize:  100,                              // P2PQuake APIの1回の最大件数
-  fetchLimit:   parseInt(process.env.FETCH_LIMIT || '300', 10),
-  maxStored:    parseInt(process.env.MAX_STORED || '5000', 10),
+  spanDays:     intEnv('SPAN_DAYS', 10),          // カバー期間（cron間隔より広く）
+  maxPages:     intEnv('MAX_PAGES', 40),          // 安全上限（最大 maxPages*100 件）
+  maxStored:    intEnv('MAX_STORED', 5000),       // 蓄積上限
+  fetchLimit:   process.env.FETCH_LIMIT ? intEnv('FETCH_LIMIT', 0) : 0, // 任意の件数固定（0=無効）
   fetchTimeoutMs: 20000,
   fetchRetries: 3,                                // リトライ回数（指数バックオフ）
   reqGapMs:     1200,                             // ページ間の間隔（60req/分のレート制限に余裕）
 };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// P2PQuakeの発生時刻 "YYYY/MM/DD HH:MM:SS.ss"（JST, タイムゾーン表記なし）→ UTCエポックms
+function parseJstMs(t) {
+  const m = (t || '').match(/(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return NaN;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 9, +m[5], +m[6]); // JST(UTC+9) → UTC
+}
+
+// 1レコード1行の安定整形（有効なJSON、かつ週次更新の git 差分が行単位で読める）
+function serialize(arr) {
+  if (!arr.length) return '[]\n';
+  return '[\n' + arr.map(r => JSON.stringify(r)).join(',\n') + '\n]\n';
+}
 
 // ── マージ + 重複排除 + イベント統合 + 上限剪定（index.html と同一ロジック） ──
 function mergeData(existing, incoming) {
@@ -106,44 +139,72 @@ async function main() {
   console.log(`対象ファイル: ${DATA_PATH}`);
 
   const existing = await loadExisting();
+  const existingIds = new Set(existing.map(d => d.id));
   console.log(`既存蓄積: ${existing.length}件`);
 
-  // ページ分割取得（offset で遡る）
-  const pages = Math.ceil(CONFIG.fetchLimit / CONFIG.apiPageSize);
+  // 期間ベースのページング（offsetで遡る）。以下のいずれかで打ち切る:
+  //  - 取得済みの最古の発生時刻が cutoff より古い（対象期間をカバー済み）
+  //  - ページが全件既知（これより古いレコードも蓄積済み = 定常運用）
+  //  - フィード末尾（満たない件数）／安全上限 maxPages
+  //  ※ FETCH_LIMIT 指定時は従来どおり件数固定（手動バックフィル用）。
+  const cutoffMs = Date.now() - CONFIG.spanDays * 86400000;
+  const pageCap = CONFIG.fetchLimit
+    ? Math.min(Math.ceil(CONFIG.fetchLimit / CONFIG.apiPageSize), CONFIG.maxPages)
+    : CONFIG.maxPages;
+  if (CONFIG.fetchLimit) console.log(`FETCH_LIMIT=${CONFIG.fetchLimit} 指定 — 件数固定モード`);
+  else console.log(`期間モード — 直近 ${CONFIG.spanDays} 日をカバー（cutoff: ${new Date(cutoffMs).toISOString()}）`);
+
   const fetched = [];
-  let failed = 0;
-  for (let i = 0; i < pages; i++) {
-    const offset = i * CONFIG.apiPageSize;
-    const limit = Math.min(CONFIG.apiPageSize, CONFIG.fetchLimit - offset);
+  let failedPage = false, pagesTried = 0, stopReason = 'maxPages';
+  for (let page = 0; page < pageCap; page++) {
+    pagesTried++;
+    const offset = page * CONFIG.apiPageSize;
+    const limit = CONFIG.fetchLimit
+      ? Math.min(CONFIG.apiPageSize, CONFIG.fetchLimit - offset)
+      : CONFIG.apiPageSize;
     const url = `${CONFIG.apiBase}?codes=${CONFIG.apiCodes}&limit=${limit}&offset=${offset}`;
     console.log(`取得中: limit=${limit} offset=${offset} ...`);
+
+    let pageRecs;
     try {
-      const page = await fetchJsonWithRetry(url);
-      fetched.push(...page.filter(x => x && typeof x === 'object'));
-      console.log(`  → ${page.length}件`);
+      pageRecs = (await fetchJsonWithRetry(url)).filter(x => x && typeof x === 'object');
     } catch (e) {
-      failed++;
-      console.error(`  ✖ ページ取得失敗 (offset=${offset}): ${e.message}`);
+      failedPage = true;
+      console.error(`  ✖ ページ取得失敗 (offset=${offset}): ${e.message} — これ以上遡らず取得済み分で打ち切ります。`);
+      stopReason = 'pageError';
+      break;
     }
-    if (i < pages - 1) await sleep(CONFIG.reqGapMs);
+    fetched.push(...pageRecs);
+    console.log(`  → ${pageRecs.length}件`);
+
+    if (CONFIG.fetchLimit) { if (offset + limit >= CONFIG.fetchLimit) { stopReason = 'fetchLimit'; break; } }
+    else {
+      if (pageRecs.length < CONFIG.apiPageSize) { stopReason = 'feedEnd'; break; }            // フィード末尾
+      if (pageRecs.every(r => existingIds.has(r.id))) { stopReason = 'caughtUp'; break; }      // 既知に追いついた
+      const times = pageRecs.map(r => parseJstMs(r.earthquake?.time)).filter(Number.isFinite);
+      const oldest = times.length ? Math.min(...times) : NaN;
+      if (Number.isFinite(oldest) && oldest <= cutoffMs) { stopReason = 'spanCovered'; break; } // 期間カバー済み
+    }
+    await sleep(CONFIG.reqGapMs);
   }
 
   if (!fetched.length) {
-    console.error('取得できたデータが0件です。既存ファイルは変更しません。');
+    // 取得0件 = 全ページ不達（ネットワーク/API障害）。既存ファイルは保持し、失敗として通知する。
+    console.error('取得できたデータが0件です（API不達の可能性）。既存ファイルは変更しません。');
     process.exitCode = 1;
     return;
   }
-  if (failed) console.warn(`一部ページ取得失敗（${failed}/${pages}）。取得できた分のみ反映します。`);
+  if (failedPage) console.warn(`一部ページ取得で失敗あり。取得できた分のみ反映します。`);
 
   const merged = mergeData(existing, fetched);
-  const added = merged.length - existing.length;
+  // 「新規」は id の集合差で正確に数える（length差だと統合・剪定で負やゼロになりうる）
+  const addedCount = merged.filter(d => !existingIds.has(d.id)).length;
 
   await mkdir(dirname(DATA_PATH), { recursive: true });
-  // 改行区切りに近い安定した整形（差分を読みやすく）。末尾に改行。
-  await writeFile(DATA_PATH, JSON.stringify(merged, null, 0) + '\n', 'utf8');
+  await writeFile(DATA_PATH, serialize(merged), 'utf8');
 
   console.log('--- 結果 ---');
-  console.log(`取得: ${fetched.length}件 / 新規追加: ${added}件 / 蓄積合計: ${merged.length}件`);
+  console.log(`取得: ${fetched.length}件（${pagesTried}ページ, 停止理由: ${stopReason}） / 新規: ${addedCount}件 / 蓄積合計: ${merged.length}件`);
   console.log('保存完了:', DATA_PATH);
 }
 
